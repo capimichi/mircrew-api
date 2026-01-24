@@ -37,16 +37,16 @@
 
 | Requirement ID | Roadmap Phase |
 |----------------|---------------|
-| AUTH-01 | TBD |
-| AUTH-02 | TBD |
-| AUTH-03 | TBD |
-| AUTH-04 | TBD |
-| SEARCH-01 | TBD |
-| SEARCH-02 | TBD |
-| SEARCH-03 | TBD |
-| MAGNET-01 | TBD |
-| MAGNET-02 | TBD |
-| MAGNET-03 | TBD |
-| MAGNET-04 | TBD |
-| OBS-01 | TBD |
-| OBS-02 | TBD |
+| AUTH-01 | Phase 2 |
+| AUTH-02 | Phase 1 |
+| AUTH-03 | Phase 3 |
+| AUTH-04 | Phase 3 |
+| SEARCH-01 | Phase 7 |
+| SEARCH-02 | Phase 4 |
+| SEARCH-03 | Phase 4 |
+| MAGNET-01 | Phase 5 |
+| MAGNET-02 | Phase 5 |
+| MAGNET-03 | Phase 6 |
+| MAGNET-04 | Phase 6 |
+| OBS-01 | Phase 8 |
+| OBS-02 | Phase 8 |
