@@ -70,12 +70,19 @@ class MircrewClient:
     def _ensure_login(self) -> None:
         if self._cookie and self._cookie_time:
             if datetime.utcnow() - self._cookie_time < self._COOKIE_TTL:
-                return
+                if self._is_logged_in():
+                    return
         if not self.username or not self.password:
             raise ValueError("Missing MIRCREW_USERNAME or MIRCREW_PASSWORD")
 
-        index_response = requests.get(self._INDEX_URL, timeout=30)
+        index_response = requests.get(
+            self._INDEX_URL,
+            headers=self._default_headers(referer=self._INDEX_URL),
+            timeout=30,
+        )
         index_response.raise_for_status()
+        if self._is_logged_in_html(index_response.text):
+            return
         tokens = self._parse_login_tokens(index_response.text)
 
         login_payload = {
@@ -99,6 +106,8 @@ class MircrewClient:
         self._cookie = self._merge_set_cookies(login_response)
         self._cookie_time = datetime.utcnow()
         self._cache_cookie()
+        if not self._is_logged_in():
+            raise RuntimeError("Login failed")
 
     def _extract_magnets(self, post_url: str) -> list[SearchResult]:
         response = requests.get(
@@ -159,6 +168,20 @@ class MircrewClient:
         if not creation or not form:
             raise ValueError("Login tokens not found on index page")
         return _LoginTokens(creation_time=creation["value"], form_token=form["value"])
+
+    def _is_logged_in(self) -> bool:
+        response = requests.get(
+            self._INDEX_URL,
+            headers=self._default_headers(referer=self._INDEX_URL),
+            timeout=30,
+        )
+        response.raise_for_status()
+        return self._is_logged_in_html(response.text)
+
+    @staticmethod
+    def _is_logged_in_html(html: str) -> bool:
+        soup = BeautifulSoup(html, "html.parser")
+        return soup.select_one('[title="Login"]') is None
 
     def _merge_set_cookies(self, response: requests.Response) -> str:
         set_cookies: Iterable[str] = ()
