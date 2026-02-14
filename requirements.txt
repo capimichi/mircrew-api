@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+injector
+python-dotenv
+requests
+beautifulsoup4
+click
+pytest
+httpx

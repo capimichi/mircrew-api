@@ -1,0 +1,8 @@
+services:
+  mircrew-api:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    command: ["python", "-m", "mircrewapi.api"]
