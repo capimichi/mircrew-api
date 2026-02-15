@@ -1,10 +1,10 @@
-import logging
 import os
 
 from dotenv import load_dotenv
 from injector import Injector
 
 from mircrewapi.client.mircrew_client import MircrewClient
+from mircrewapi.logger.app_logger import AppLogger
 from mircrewapi.manager.cache_manager import CacheManager
 
 
@@ -56,13 +56,7 @@ class DefaultContainer:
         self.mircrew_password = os.environ.get('MIRCREW_PASSWORD', '')
 
     def _init_logging(self):
-        logging.basicConfig(
-            filename=self.app_log_path,
-            level=logging.DEBUG if self.debug else logging.INFO,
-            filemode='a',
-            format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
-            datefmt='%H:%M:%S',
-        )
+        AppLogger(self.log_dir, debug=self.debug).configure_root()
 
     def _init_bindings(self):
         cache_manager = CacheManager(cache_dir=os.path.join(self.root_dir, self.cache_dir))

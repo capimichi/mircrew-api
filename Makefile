@@ -1,4 +1,4 @@
-.PHONY: test test-unit test-integration test-functional test-network
+.PHONY: test test-unit test-integration test-functional test-network env-up env-down
 
 PYTHON := .venv/bin/python
 PYTEST := $(PYTHON) -m pytest
@@ -19,3 +19,9 @@ test-functional:
 
 test-network:
 	$(PYTEST) -m "network"
+
+env-up:
+	./scripts/sync_env.sh up
+
+env-down:
+	./scripts/sync_env.sh down

@@ -18,6 +18,12 @@ def test_has_quality_keyword():
     assert client._has_quality_keyword("Some Movie SD") is False
 
 
+def test_extract_post_id():
+    client = MircrewClient(username="user", password="pass")
+    assert client._extract_post_id("https://mircrew-releases.org/viewtopic.php?t=123") == "123"
+    assert client._extract_post_id("https://mircrew-releases.org/viewtopic.php") is None
+
+
 def test_merge_set_cookies():
     class DummyRawHeaders:
         def get_all(self, key):

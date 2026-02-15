@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import json
+import logging
+from pathlib import Path
 from typing import Iterable
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from camoufox.async_api import AsyncCamoufox
 
 from mircrewapi.manager.cache_manager import CacheManager
+from mircrewapi.model.client.post_result import PostResult
 from mircrewapi.model.client.search_result import SearchResult
 
 
@@ -35,37 +40,46 @@ class MircrewClient:
         "x265",
         "x264",
     )
+    _STATE_FILENAME = "mircrew_state.json"
 
     def __init__(self, username: str, password: str, cache_manager: CacheManager | None = None):
         self.username = username
         self.password = password
         self._cache_manager = cache_manager
+        self._session = requests.Session()
         self._cookie: str | None = None
         self._cookie_time: datetime | None = None
         self._restore_cached_cookie()
+        self._logger = logging.getLogger(self.__class__.__name__)
+        self._session.cookies.set("cookieconsent_status", "dismiss")
 
-    def search(self, query: str) -> list[SearchResult]:
+    def search_posts(self, query: str) -> list[PostResult]:
         self._ensure_login()
 
-        response = requests.get(
-            self._SEARCH_URL,
-            params={"keywords": query, "sf": "titleonly", "sr": "topics"},
-            headers=self._default_headers(referer=self._INDEX_URL),
-            timeout=30,
-        )
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        results: list[SearchResult] = []
+        search_html = self._perform_browser_search(query)
+        soup = BeautifulSoup(search_html, "html.parser")
+        results: list[PostResult] = []
         for row in soup.select("li.row"):
-            if not self._has_quality_keyword(row.get_text(" ", strip=True)):
-                continue
-            link = row.select_one("a.row-item-link")
+            link = row.select_one("a.topictitle")
             if not link or not link.get("href"):
                 continue
             post_url = urljoin(self._BASE_URL, link["href"])
-            results.extend(self._extract_magnets(post_url))
+            post_id = self._extract_post_id(post_url)
+            if not post_id:
+                continue
+            title = link.get_text(" ", strip=True)
+            if not self._has_quality_keyword(title):
+                continue
+            results.append(PostResult(id=post_id, title=title, url=post_url))
         return results
+
+    def get_magnets(self, post_id: str) -> list[SearchResult]:
+        self._ensure_login()
+        post_url = self._build_post_url(post_id)
+        return self._extract_magnets(None, post_url)
+
+    def build_post_url(self, post_id: str) -> str:
+        return self._build_post_url(post_id)
 
     def _ensure_login(self) -> None:
         if self._cookie and self._cookie_time:
@@ -75,77 +89,162 @@ class MircrewClient:
         if not self.username or not self.password:
             raise ValueError("Missing MIRCREW_USERNAME or MIRCREW_PASSWORD")
 
-        index_response = requests.get(
-            self._INDEX_URL,
-            headers=self._default_headers(referer=self._INDEX_URL),
-            timeout=30,
-        )
-        index_response.raise_for_status()
-        if self._is_logged_in_html(index_response.text):
-            return
-        tokens = self._parse_login_tokens(index_response.text)
+        if self._restore_browser_state():
+            if self._is_logged_in():
+                return
 
-        login_payload = {
-            "username": self.username,
-            "password": self.password,
-            "autologin": "on",
-            "login": "Login",
-            "redirect": "./index.php?",
-            "creation_time": tokens.creation_time,
-            "form_token": tokens.form_token,
-        }
+        if not self._perform_browser_login():
+            self._logger.warning("Login failed during headless flow.")
+            raise RuntimeError("Login failed")
+        # Headless flow already validated login and stored cookies.
+        return
 
-        login_response = requests.post(
-            self._LOGIN_URL,
-            data=login_payload,
-            headers=self._default_headers(referer=f"{self._INDEX_URL}?"),
-            timeout=30,
-        )
-        login_response.raise_for_status()
+    def _perform_browser_login(self) -> bool:
+        self._logger.info("Starting headless login via Camoufox.")
+        screenshot_dir = self._ensure_screenshot_dir()
 
-        self._cookie = self._merge_set_cookies(login_response)
+        async def _login() -> dict:
+            async with AsyncCamoufox(headless=True) as browser:
+                context = await browser.new_context()
+                page = await context.new_page()
+                await page.goto(self._LOGIN_URL, wait_until="domcontentloaded")
+                await page.screenshot(path=str(screenshot_dir / "login_page.png"), full_page=True)
+                try:
+                    await page.wait_for_selector("form#login", timeout=10000)
+                except Exception:
+                    html = await page.content()
+                    self._logger.warning("Login form not found. Page length=%s", len(html))
+                    await page.screenshot(path=str(screenshot_dir / "login_form_missing.png"), full_page=True)
+                    await context.close()
+                    await browser.close()
+                    return {}
+
+                await page.fill("form#login input[name='username']", self.username)
+                await page.fill("form#login input[name='password']", self.password)
+                await page.check("form#login input[name='autologin']")
+                await page.check("form#login input[name='viewonline']")
+                await page.click("form#login input[type='submit']")
+                await page.wait_for_load_state("networkidle")
+                await page.screenshot(path=str(screenshot_dir / "after_submit.png"), full_page=True)
+
+                error_text = None
+                error_el = page.locator("div.error")
+                if await error_el.count() > 0:
+                    try:
+                        error_text = await error_el.first.text_content()
+                    except Exception:
+                        error_text = None
+                if error_text:
+                    self._logger.warning("Login error text: %s", error_text.strip())
+
+                await page.goto(self._INDEX_URL, wait_until="domcontentloaded")
+                await page.screenshot(path=str(screenshot_dir / "index_after_login.png"), full_page=True)
+                logout_el = page.locator('a[href^="./ucp.php?mode=logout&sid="]')
+                logged_in = await logout_el.count() > 0
+                self._logger.info("Headless login check: %s", logged_in)
+
+                storage = await context.storage_state(path=str(self._state_path()))
+                await context.close()
+                await browser.close()
+                return {"storage": storage, "logged_in": logged_in}
+
+        result = _run_async(_login())
+        if not result or not isinstance(result, dict):
+            return False
+        storage_state = result.get("storage")
+        if not storage_state:
+            return False
+        self._save_storage_state(storage_state)
+        self._apply_storage_state(storage_state)
+        self._cookie = self._cookie_from_session()
         self._cookie_time = datetime.utcnow()
         self._cache_cookie()
-        if not self._is_logged_in():
-            raise RuntimeError("Login failed")
+        return bool(result.get("logged_in"))
 
-    def _extract_magnets(self, post_url: str) -> list[SearchResult]:
-        response = requests.get(
-            post_url,
-            headers=self._default_headers(referer=self._INDEX_URL),
-            timeout=30,
-        )
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
+    def _perform_browser_search(self, query: str) -> str:
+        self._logger.info("Starting headless search via Camoufox.")
+        screenshot_dir = self._ensure_screenshot_dir()
 
-        if self._has_like_link(soup):
-            like_url = self._extract_like_url(soup)
-            if like_url:
-                requests.get(
-                    like_url,
-                    headers=self._default_headers(referer=post_url),
-                    timeout=30,
+        async def _search() -> str:
+            async with AsyncCamoufox(headless=True) as browser:
+                context = await browser.new_context(storage_state=str(self._state_path()))
+                page = await context.new_page()
+                await page.goto(self._INDEX_URL, wait_until="domcontentloaded")
+                await page.screenshot(path=str(screenshot_dir / "search_page.png"), full_page=True)
+
+                try:
+                    await page.wait_for_selector("#keywords", timeout=10000)
+                    await page.fill("#keywords", query)
+                    await page.click(".button-search")
+                    await page.wait_for_load_state("networkidle")
+                except Exception:
+                    html = await page.content()
+                    await page.screenshot(path=str(screenshot_dir / "search_failed.png"), full_page=True)
+                    await context.close()
+                    await browser.close()
+                    return html
+
+                await page.screenshot(path=str(screenshot_dir / "search_results.png"), full_page=True)
+                html = await page.content()
+                await context.close()
+                await browser.close()
+                return html
+
+        return _run_async(_search())
+
+    def _extract_magnets(self, title: str | None, post_url: str) -> list[SearchResult]:
+        screenshot_dir = self._ensure_screenshot_dir()
+
+        async def _extract() -> list[SearchResult]:
+            async with AsyncCamoufox(headless=True) as browser:
+                context = await browser.new_context(storage_state=str(self._state_path()))
+                page = await context.new_page()
+                await page.goto(post_url, wait_until="domcontentloaded")
+                await page.screenshot(path=str(screenshot_dir / "post_page.png"), full_page=True)
+
+                thank_selector = (
+                    ".post a:has(i.fa-thumbs-o-up),"
+                    " .post a:has(i.fa-thumbs-up),"
+                    " .post a:has(i.icon-thumbs-up)"
                 )
-                response = requests.get(
-                    post_url,
-                    headers=self._default_headers(referer=post_url),
-                    timeout=30,
-                )
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, "html.parser")
+                thank_button = page.locator(thank_selector)
+                if await thank_button.count() > 0:
+                    try:
+                        if await thank_button.first.is_visible():
+                            await thank_button.first.click(timeout=1000)
+                            await page.wait_for_load_state("networkidle")
+                            await page.screenshot(
+                                path=str(screenshot_dir / "post_after_thanks.png"),
+                                full_page=True,
+                            )
+                            await page.goto(post_url, wait_until="domcontentloaded")
+                            await page.wait_for_load_state("networkidle")
+                    except Exception as exc:
+                        self._logger.warning("Unable to click thanks button: %s", exc)
 
-        title = self._extract_title(soup)
-        results: list[SearchResult] = []
-        for dd in soup.select("dd"):
-            if "magnet" not in dd.get_text(" ", strip=True).lower():
-                continue
-            link = dd.find("a", href=True)
-            if not link:
-                continue
-            href = link["href"]
-            if href.startswith("magnet:"):
-                results.append(SearchResult(title=title, url=href))
-        return results
+                results: list[SearchResult] = []
+                boxes = page.locator(".hidebox.unhide dd")
+                count = await boxes.count()
+                for idx in range(count):
+                    box = boxes.nth(idx)
+                    magnet_el = box.locator('a[href^="magnet:"]')
+                    if await magnet_el.count() == 0:
+                        continue
+                    href = await magnet_el.first.get_attribute("href")
+                    if not href:
+                        continue
+                    title_el = box.locator("p").first
+                    item_title = None
+                    if await title_el.count() > 0:
+                        item_title = (await title_el.text_content()) or ""
+                    item_title = (item_title or "").strip() or title or "Magnet"
+                    results.append(SearchResult(title=item_title, url=href))
+
+                await context.close()
+                await browser.close()
+                return results
+
+        return _run_async(_extract())
 
     def _default_headers(self, referer: str | None = None) -> dict:
         headers = {
@@ -153,12 +252,10 @@ class MircrewClient:
             "accept-language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
             "cache-control": "max-age=0",
             "upgrade-insecure-requests": "1",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
         if referer:
             headers["referer"] = referer
-        if self._cookie:
-            headers["Cookie"] = self._cookie
         return headers
 
     def _parse_login_tokens(self, html: str) -> _LoginTokens:
@@ -170,18 +267,21 @@ class MircrewClient:
         return _LoginTokens(creation_time=creation["value"], form_token=form["value"])
 
     def _is_logged_in(self) -> bool:
-        response = requests.get(
+        response = self._session.get(
             self._INDEX_URL,
             headers=self._default_headers(referer=self._INDEX_URL),
             timeout=30,
         )
+        if response.status_code == 403:
+            self._logger.warning("Login check blocked (403). Treating as not logged in.")
+            return False
         response.raise_for_status()
         return self._is_logged_in_html(response.text)
 
     @staticmethod
     def _is_logged_in_html(html: str) -> bool:
         soup = BeautifulSoup(html, "html.parser")
-        return soup.select_one('[title="Login"]') is None
+        return soup.select_one('a[href*="ucp.php?mode=logout"]') is not None
 
     def _merge_set_cookies(self, response: requests.Response) -> str:
         set_cookies: Iterable[str] = ()
@@ -205,31 +305,99 @@ class MircrewClient:
             return
         self._cookie = item.value
         self._cookie_time = item.created_at
+        for chunk in self._cookie.split(";"):
+            chunk = chunk.strip()
+            if not chunk or "=" not in chunk:
+                continue
+            key, value = chunk.split("=", 1)
+            self._session.cookies.set(key, value)
 
     def _cache_cookie(self) -> None:
         if not self._cache_manager or not self._cookie:
             return
         self._cache_manager.set("mircrew_cookie", self._cookie, self._COOKIE_TTL)
 
+    def _cookie_from_session(self) -> str:
+        cookies = []
+        for cookie in self._session.cookies:
+            cookies.append(f"{cookie.name}={cookie.value}")
+        return "; ".join(cookies)
+
+    def _cookie_names_from_session(self) -> list[str]:
+        return [cookie.name for cookie in self._session.cookies]
+
+    def _extract_thankyou_url(self, soup: BeautifulSoup) -> str | None:
+        link = soup.select_one("ul.post-buttons li:nth-last-child(1) a")
+        if not link or not link.get("href"):
+            return None
+        return urljoin(self._BASE_URL, link["href"])
 
     def _has_quality_keyword(self, text: str) -> bool:
         lowered = text.lower()
         return any(keyword in lowered for keyword in self._QUALITY_KEYWORDS)
 
-    def _has_like_link(self, soup: BeautifulSoup) -> bool:
-        return self._extract_like_url(soup) is not None
-
-    def _extract_like_url(self, soup: BeautifulSoup) -> str | None:
-        post = soup.select_one(".post")
-        if not post:
+    def _extract_post_id(self, post_url: str) -> str | None:
+        try:
+            parsed = urlparse(post_url)
+        except ValueError:
             return None
-        for link in post.find_all("a", href=True):
-            if link.find("i", class_="fa-thumbs-o-up"):
-                return urljoin(self._BASE_URL, link["href"])
-        return None
+        query = parse_qs(parsed.query)
+        ids = query.get("t")
+        if not ids:
+            return None
+        return ids[0]
 
-    def _extract_title(self, soup: BeautifulSoup) -> str:
-        title_el = soup.select_one("p")
-        if title_el:
-            return title_el.get_text(" ", strip=True)
-        return "Mircrew search result"
+    def _build_post_url(self, post_id: str) -> str:
+        return f"{self._BASE_URL}/viewtopic.php?t={post_id}"
+
+    def _state_path(self) -> Path:
+        if not self._cache_manager:
+            return Path(self._STATE_FILENAME)
+        return Path(self._cache_manager._cache_dir) / self._STATE_FILENAME
+
+    def _ensure_screenshot_dir(self) -> Path:
+        if self._cache_manager:
+            base_dir = Path(self._cache_manager._cache_dir)
+        else:
+            base_dir = Path("var")
+        screenshot_dir = base_dir / "screenshots"
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        return screenshot_dir
+
+    def _save_storage_state(self, storage_state: dict) -> None:
+        path = self._state_path()
+        path.write_text(json.dumps(storage_state))
+
+    def _restore_browser_state(self) -> bool:
+        path = self._state_path()
+        if not path.exists():
+            return False
+        try:
+            storage_state = json.loads(path.read_text())
+        except Exception:
+            return False
+        self._apply_storage_state(storage_state)
+        return True
+
+    def _apply_storage_state(self, storage_state: dict) -> None:
+        cookies = storage_state.get("cookies", []) if isinstance(storage_state, dict) else []
+        for cookie in cookies:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            domain = cookie.get("domain")
+            if not name or value is None:
+                continue
+            self._session.cookies.set(name, value, domain=domain)
+
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+
+def _run_async(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(lambda: asyncio.run(coro)).result()

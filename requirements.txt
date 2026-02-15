@@ -7,3 +7,5 @@ beautifulsoup4
 click
 pytest
 httpx
+playwright
+camoufox
